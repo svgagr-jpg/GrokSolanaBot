@@ -1,98 +1,65 @@
 
 import streamlit as st
-import streamlit.components.v1 as components
 import requests
 import sqlite3
 import pandas as pd
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 # =========================================================
-# GROKSOLANABOT V3 PRO
-# Paper trading only. No wallet. No real transactions.
+# GROK SOLANA SNIPER V4 PRO
+# PAPER TRADING ONLY
 # =========================================================
 
 st.set_page_config(
-    page_title="GROK SOLANA SNIPER PRO",
+    page_title="GROK SOLANA SNIPER V4 PRO",
     page_icon="⚡",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    layout="wide"
 )
 
 DB = "bot.db"
-REFRESH_SECONDS = 5
+REFRESH = 5000
 SCAN_INTERVAL = 60
-TRADE_CHECK_INTERVAL = 30
+TRADE_CHECK = 30
+STARTING_CASH = 1000.0
 
-API_PROFILES = "https://api.dexscreener.com/token-profiles/latest/v1"
-API_PAIRS = "https://api.dexscreener.com/token-pairs/v1/solana/{}"
+PROFILES_URL = "https://api.dexscreener.com/token-profiles/latest/v1"
+PAIRS_URL = "https://api.dexscreener.com/token-pairs/v1/solana/{}"
 
 # ---------------- DESIGN ----------------
 
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Space+Mono:wght@400;700&display=swap');
-
-html, body, [class*="css"] {
-    font-family: Inter, sans-serif;
-}
-.stApp {
-    background: #080b10;
-    color: #e7edf5;
-}
-[data-testid="stSidebar"] {
-    background: #0c1119;
-    border-right: 1px solid #1b2935;
-}
-h1, h2, h3 {
-    color: #eaf2f8;
-}
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&family=Space+Mono:wght@400;700&display=swap');
+html, body, [class*="css"] {font-family:Inter,sans-serif;}
+.stApp {background:#080b10;color:#e7edf5;}
+[data-testid="stSidebar"] {background:#0c1119;border-right:1px solid #1b2935;}
 div[data-testid="stMetric"] {
-    background: #101923;
-    border: 1px solid #1c303b;
-    padding: 16px;
-    border-radius: 12px;
+    background:#101923;border:1px solid #1c303b;
+    padding:15px;border-radius:12px;
 }
 div[data-testid="stMetricValue"] {
-    color: #35e6a1;
-    font-family: 'Space Mono', monospace;
+    color:#35e6a1;font-family:'Space Mono',monospace;
 }
-.stButton > button {
-    background: #14c98a;
-    color: #06120e;
-    border: 0;
-    border-radius: 8px;
-    font-weight: 800;
-    min-height: 42px;
+.stButton>button {
+    background:#14c98a;color:#06120e;border:0;
+    border-radius:8px;font-weight:800;min-height:42px;
 }
-.stButton > button:hover {
-    background: #35e6a1;
-    color: #06120e;
-}
-section[data-testid="stMain"] {
-    background: #080b10;
-}
-hr {
-    border-color: #1b2935;
-}
-.small-muted {
-    color: #8293a5;
-    font-size: 12px;
-}
-.terminal {
-    font-family: 'Space Mono', monospace;
-    color: #35e6a1;
-}
+.stButton>button:hover {background:#35e6a1;color:#06120e;}
+h1,h2,h3 {color:#eaf2f8;}
+hr {border-color:#1b2935;}
+.terminal {font-family:'Space Mono',monospace;color:#35e6a1;}
+.muted {color:#8293a5;font-size:12px;}
 </style>
 """, unsafe_allow_html=True)
 
 # ---------------- DATABASE ----------------
 
-def db():
+def connect():
     return sqlite3.connect(DB, timeout=20)
 
 def init_db():
-    with db() as con:
+    with connect() as con:
         con.execute("""
         CREATE TABLE IF NOT EXISTS sniper_trades_v3 (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -112,6 +79,7 @@ def init_db():
             auto_trade INTEGER DEFAULT 0
         )
         """)
+
         con.execute("""
         CREATE TABLE IF NOT EXISTS sniper_snapshots_v3 (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -121,203 +89,240 @@ def init_db():
             pnl REAL
         )
         """)
+
         con.execute("""
-        CREATE TABLE IF NOT EXISTS sniper_volume_history_v3 (
-            token_address TEXT,
-            timestamp REAL,
+        CREATE TABLE IF NOT EXISTS v4_price_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            address TEXT,
+            symbol TEXT,
+            timestamp TEXT,
+            price REAL,
             volume REAL
         )
         """)
+
         con.execute("""
-        CREATE TABLE IF NOT EXISTS sniper_cooldowns_v3 (
-            token_address TEXT PRIMARY KEY,
-            timestamp REAL
+        CREATE TABLE IF NOT EXISTS v4_cooldowns (
+            address TEXT PRIMARY KEY,
+            last_trade REAL
         )
         """)
+
         con.commit()
 
 init_db()
 
-# ---------------- SESSION STATE ----------------
+# ---------------- SESSION ----------------
 
 defaults = {
     "tokens": [],
     "last_scan": 0,
     "last_trade_check": 0,
     "last_snapshot": 0,
-    "scan_message": "Waiting for scan",
+    "last_auto_scan": 0,
     "auto_enabled": False,
-    "starting_cash": 1000.0
+    "scan_message": "Waiting for scan",
+    "last_auto_message": "Auto Sniper waiting",
+    "scan_number": 0
 }
 
 for key, value in defaults.items():
     if key not in st.session_state:
         st.session_state[key] = value
 
-# ---------------- API HELPERS ----------------
+# ---------------- HELPERS ----------------
 
-def safe_float(value, default=0):
+def number(value, default=0):
     try:
         return float(value or 0)
-    except:
+    except (ValueError, TypeError):
         return default
+
+def now_utc():
+    return datetime.now(timezone.utc)
 
 def get_profiles():
     try:
-        r = requests.get(API_PROFILES, timeout=12)
-        r.raise_for_status()
-        data = r.json()
+        response = requests.get(PROFILES_URL, timeout=15)
+        response.raise_for_status()
+        data = response.json()
         return [
-            x for x in data
-            if x.get("chainId") == "solana" and x.get("tokenAddress")
+            item for item in data
+            if item.get("chainId") == "solana"
+            and item.get("tokenAddress")
         ]
     except Exception:
         return []
 
 def get_pairs(address):
     try:
-        r = requests.get(API_PAIRS.format(address), timeout=12)
-        r.raise_for_status()
-        data = r.json()
-        if not isinstance(data, list):
-            return []
-        return [
-            p for p in data
-            if p.get("chainId") == "solana"
-        ]
+        response = requests.get(PAIRS_URL.format(address), timeout=15)
+        response.raise_for_status()
+        data = response.json()
+        if isinstance(data, list):
+            return [p for p in data if p.get("chainId") == "solana"]
     except Exception:
-        return []
+        pass
+    return []
 
-def choose_pair(pairs):
+def best_pair(pairs):
     if not pairs:
         return None
     return max(
         pairs,
-        key=lambda p: safe_float(
-            (p.get("liquidity") or {}).get("usd")
-        )
+        key=lambda p: number((p.get("liquidity") or {}).get("usd"))
     )
 
-# ---------------- VOLUME HISTORY ----------------
+# ---------------- PRICE HISTORY ----------------
 
-def record_volume(address, volume):
-    now = time.time()
-    with db() as con:
+def save_price(token):
+    with connect() as con:
         con.execute("""
-        INSERT INTO sniper_volume_history_v3
-        (token_address, timestamp, volume)
-        VALUES (?, ?, ?)
-        """, (address, now, volume))
+        INSERT INTO v4_price_history
+        (address, symbol, timestamp, price, volume)
+        VALUES (?, ?, ?, ?, ?)
+        """, (
+            token["address"],
+            token["symbol"],
+            now_utc().isoformat(),
+            token["price"],
+            token["volume"]
+        ))
 
         con.execute("""
-        DELETE FROM sniper_volume_history_v3
+        DELETE FROM v4_price_history
         WHERE timestamp < ?
-        """, (now - 86400,))
-
+        """, ((now_utc() - timedelta(days=3)).isoformat(),))
         con.commit()
 
-def volume_spike(address, current_volume):
-    with db() as con:
-        rows = con.execute("""
-        SELECT volume FROM sniper_volume_history_v3
-        WHERE token_address = ?
-        AND timestamp > ?
-        ORDER BY timestamp DESC
-        LIMIT 10
-        """, (address, time.time() - 3600)).fetchall()
+def get_price_history(address):
+    with connect() as con:
+        return pd.read_sql_query("""
+        SELECT timestamp, price
+        FROM v4_price_history
+        WHERE address = ?
+        ORDER BY id ASC
+        """, con, params=(address,))
 
-    if len(rows) < 2:
+# ---------------- COOLDOWN ----------------
+
+def on_cooldown(address, hours):
+    with connect() as con:
+        row = con.execute("""
+        SELECT last_trade FROM v4_cooldowns
+        WHERE address = ?
+        """, (address,)).fetchone()
+
+    if not row:
         return False
 
-    previous = [safe_float(x[0]) for x in rows]
-    baseline = sum(previous) / len(previous)
+    return time.time() - number(row[0]) < hours * 3600
 
-    return baseline > 0 and current_volume >= baseline * 2
+def set_cooldown(address):
+    with connect() as con:
+        con.execute("""
+        INSERT INTO v4_cooldowns(address, last_trade)
+        VALUES (?, ?)
+        ON CONFLICT(address)
+        DO UPDATE SET last_trade = excluded.last_trade
+        """, (address, time.time()))
+        con.commit()
 
-# ---------------- TOKEN ANALYSIS ----------------
+# ---------------- ANTI SCAM + SMART ENTRY ----------------
 
-def analyze_token(pair):
+def analyze(pair, old_tokens):
     base = pair.get("baseToken") or {}
     address = base.get("address", "")
     symbol = base.get("symbol", "UNKNOWN")
     name = base.get("name", symbol)
 
-    price = safe_float(pair.get("priceUsd"))
-    liquidity = safe_float((pair.get("liquidity") or {}).get("usd"))
-    volume = safe_float((pair.get("volume") or {}).get("h24"))
-    change = safe_float((pair.get("priceChange") or {}).get("h24"))
+    price = number(pair.get("priceUsd"))
+    liquidity = number((pair.get("liquidity") or {}).get("usd"))
+    volume = number((pair.get("volume") or {}).get("h24"))
+    change = number((pair.get("priceChange") or {}).get("h24"))
 
     txns = pair.get("txns") or {}
     h24 = txns.get("h24") or {}
-    buys = safe_float(h24.get("buys"))
-    sells = safe_float(h24.get("sells"))
-    total_txns = buys + sells
+    buys = number(h24.get("buys"))
+    sells = number(h24.get("sells"))
+    total = buys + sells
 
+    created = number(pair.get("pairCreatedAt"))
     age_hours = 9999
-    created = safe_float(pair.get("pairCreatedAt"))
-    if created > 0:
+    if created:
         age_hours = max(0, (time.time() * 1000 - created) / 3600000)
 
     flags = []
 
     if liquidity < 5000:
         flags.append("LOW LIQUIDITY")
-
-    if volume < 1000:
+    if liquidity < 1500:
+        flags.append("VERY LOW LIQUIDITY")
+    if volume < 2000:
         flags.append("LOW VOLUME")
-
-    if total_txns < 10:
+    if total < 10:
         flags.append("LOW ACTIVITY")
-
-    if change < -50:
+    if change < -40:
         flags.append("LARGE PRICE DROP")
-
     if change > 150:
         flags.append("EXTREME PRICE MOVE")
-
-    if sells == 0 and buys > 10:
+    if buys > 15 and sells == 0:
         flags.append("NO RECORDED SELLS")
+    if age_hours < 1:
+        flags.append("VERY NEW PAIR")
 
-    # Rule-based score, not an AI prediction
-    liquidity_score = min(liquidity / 2500, 40)
+    old = next(
+        (t for t in old_tokens if t["address"] == address),
+        None
+    )
 
-    volume_ratio = volume / max(liquidity, 1)
-    volume_score = min(volume_ratio / 1.5, 1) * 30
+    spike = False
+    if old and old["volume"] > 0:
+        spike = volume >= old["volume"] * 1.5
+
+    if spike:
+        flags.append("VOLUME SPIKE")
+
+    # Rule-based market score. Not AI.
+    liquidity_score = min(liquidity / 2500, 35)
+    volume_score = min((volume / max(liquidity, 1)) / 1.5, 1) * 25
 
     if 0 < change <= 50:
         momentum_score = 20
     elif 50 < change <= 100:
         momentum_score = 12
     elif -10 <= change <= 0:
-        momentum_score = 10
+        momentum_score = 12
     elif change > 100:
-        momentum_score = 5
+        momentum_score = 4
     else:
         momentum_score = 0
 
-    activity_score = min(total_txns / 10, 10)
-
+    activity_score = min(total / 10, 20)
     score = int(min(100, max(
         0,
         liquidity_score + volume_score +
         momentum_score + activity_score
     )))
 
-    spike = volume_spike(address, volume)
-
-    if spike:
-        flags.append("VOLUME SPIKE")
-
+    # Warning heuristics only. Not a verified scam detector.
     severe = (
-        liquidity < 1000 or
-        price <= 0 or
-        change < -70 or
-        "NO RECORDED SELLS" in flags
+        price <= 0
+        or liquidity < 1500
+        or change < -60
+        or "NO RECORDED SELLS" in flags
     )
 
     if severe or score < 30:
         signal = "AVOID"
-    elif score >= 65 and liquidity >= 5000 and total_txns >= 10:
+    elif (
+        score >= 70
+        and liquidity >= 5000
+        and volume >= 5000
+        and total >= 10
+        and change < 100
+        and not on_cooldown(address, 1)
+    ):
         signal = "BUY"
     else:
         signal = "WATCH"
@@ -342,77 +347,85 @@ def analyze_token(pair):
 
 # ---------------- SCANNER ----------------
 
-def scan_tokens():
+def scan():
     profiles = get_profiles()
     results = []
     seen = set()
+    previous = st.session_state.tokens
 
     for profile in profiles[:35]:
         address = profile.get("tokenAddress")
-
         if not address or address in seen:
             continue
 
         seen.add(address)
-
-        pairs = get_pairs(address)
-        pair = choose_pair(pairs)
-
+        pair = best_pair(get_pairs(address))
         if not pair:
             continue
 
-        token = analyze_token(pair)
-
+        token = analyze(pair, previous)
         if token["price"] <= 0:
             continue
 
-        record_volume(address, token["volume"])
+        save_price(token)
         results.append(token)
 
     results.sort(
         key=lambda x: (x["score"], x["volume"]),
         reverse=True
     )
-
     return results[:20]
 
-# ---------------- PAPER PORTFOLIO ----------------
+# ---------------- PORTFOLIO ----------------
 
-def get_cash():
-    with db() as con:
-        rows = con.execute("""
-        SELECT amount, pnl, status
-        FROM sniper_trades_v3
-        """).fetchall()
-
-    used = sum(
-        safe_float(row[0])
-        for row in rows if row[2] == "OPEN"
-    )
-
-    realized = sum(
-        safe_float(row[1])
-        for row in rows if row[2] == "CLOSED"
-    )
-
-    return st.session_state.starting_cash - used + realized
-
-def get_open_trades():
-    with db() as con:
+def open_positions():
+    with connect() as con:
         return pd.read_sql_query("""
         SELECT * FROM sniper_trades_v3
         WHERE status = 'OPEN'
         ORDER BY id DESC
         """, con)
 
-def open_trade(token, amount, auto=False):
+def cash_balance():
+    with connect() as con:
+        rows = con.execute("""
+        SELECT amount, pnl, status
+        FROM sniper_trades_v3
+        """).fetchall()
+
+    invested = sum(
+        number(row[0]) for row in rows if row[2] == "OPEN"
+    )
+    realized = sum(
+        number(row[1]) for row in rows if row[2] == "CLOSED"
+    )
+    return STARTING_CASH - invested + realized
+
+def realized_today():
+    today = now_utc().date().isoformat()
+    with connect() as con:
+        rows = con.execute("""
+        SELECT pnl, close_time FROM sniper_trades_v3
+        WHERE status = 'CLOSED'
+        """).fetchall()
+
+    total = 0
+    for pnl, close_time in rows:
+        if close_time and str(close_time).startswith(today):
+            total += number(pnl)
+    return total
+
+def open_trade(token, amount, auto=False, cooldown_hours=1):
     if token["price"] <= 0 or amount <= 0:
         return False
 
-    if amount > get_cash():
+    if amount > cash_balance():
         return False
 
-    with db() as con:
+    if on_cooldown(token["address"], cooldown_hours):
+        return False
+
+    with connect() as con:
         existing = con.execute("""
         SELECT id FROM sniper_trades_v3
         WHERE token_address = ? AND status = 'OPEN'
@@ -424,9 +437,9 @@ def open_trade(token, amount, auto=False):
         con.execute("""
         INSERT INTO sniper_trades_v3 (
             token_address, symbol, name, entry_price,
-            current_price, amount, quantity, entry_time,
-            auto_trade
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            current_price, amount, quantity, pnl, pnl_pct,
+            status, entry_time, auto_trade
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 'OPEN', ?, ?)
         """, (
             token["address"],
             token["symbol"],
@@ -435,46 +448,18 @@ def open_trade(token, amount, auto=False):
             token["price"],
             amount,
             amount / token["price"],
-            datetime.now(timezone.utc).isoformat(),
+            now_utc().isoformat(),
             1 if auto else 0
         ))
         con.commit()
 
+    set_cooldown(token["address"])
     return True
 
-def close_trade(trade_id, price, reason="MANUAL"):
-    with db() as con:
+def update_position(trade_id, price):
+    with connect() as con:
         row = con.execute("""
-        SELECT entry_price, amount, quantity
-        FROM sniper_trades_v3
-        WHERE id = ? AND status = 'OPEN'
-        """, (trade_id,)).fetchone()
-
-        if not row:
-            return
-
-        entry, amount, quantity = row
-        pnl = (price - entry) * quantity
-        pnl_pct = ((price / entry) - 1) * 100 if entry else 0
-
-        con.execute("""
-        UPDATE sniper_trades_v3
-        SET current_price = ?, pnl = ?, pnl_pct = ?,
-            status = 'CLOSED', close_time = ?,
-            close_reason = ?
-        WHERE id = ?
-        """, (
-            price, pnl, pnl_pct,
-            datetime.now(timezone.utc).isoformat(),
-            reason, trade_id
-        ))
-        con.commit()
-
-def update_trade_price(trade_id, price):
-    with db() as con:
-        row = con.execute("""
-        SELECT entry_price, quantity
-        FROM sniper_trades_v3
+        SELECT entry_price, quantity FROM sniper_trades_v3
         WHERE id = ? AND status = 'OPEN'
         """, (trade_id,)).fetchone()
 
@@ -483,90 +468,119 @@ def update_trade_price(trade_id, price):
 
         entry, quantity = row
         pnl = (price - entry) * quantity
-        pnl_pct = ((price / entry) - 1) * 100 if entry else 0
+        pct = ((price / entry) - 1) * 100 if entry else 0
 
         con.execute("""
         UPDATE sniper_trades_v3
         SET current_price = ?, pnl = ?, pnl_pct = ?
         WHERE id = ?
-        """, (price, pnl, pnl_pct, trade_id))
+        """, (price, pnl, pct, trade_id))
         con.commit()
+
+def close_trade(trade_id, price, reason="MANUAL"):
+    with connect() as con:
+        row = con.execute("""
+        SELECT entry_price, quantity FROM sniper_trades_v3
+        WHERE id = ? AND status = 'OPEN'
+        """, (trade_id,)).fetchone()
+
+        if not row or price <= 0:
+            return
+
+        entry, quantity = row
+        pnl = (price - entry) * quantity
+        pct = ((price / entry) - 1) * 100 if entry else 0
+
+        con.execute("""
+        UPDATE sniper_trades_v3
+        SET current_price = ?, pnl = ?, pnl_pct = ?,
+            status = 'CLOSED', close_time = ?,
+            close_reason = ?
+        WHERE id = ?
+        """, (
+            price, pnl, pct, now_utc().isoformat(),
+            reason, trade_id
+        ))
+        con.commit()
+
+# ---------------- DAILY LOSS PROTECTION ----------------
+
+def daily_limit_hit(limit):
+    return realized_today() <= -abs(limit)
 
 # ---------------- AUTO SNIPER ----------------
 
-def auto_sniper(tokens, amount, max_positions, min_score):
-    if not tokens:
-        return "No tokens available"
+def run_auto(amount, max_positions, min_score,
+             daily_limit, cooldown_hours):
+    if daily_limit_hit(daily_limit):
+        st.session_state.auto_enabled = False
+        return "DAILY LOSS LIMIT HIT. AUTO STOPPED."
 
-    opened = get_open_trades()
-
-    if len(opened) >= max_positions:
+    positions = open_positions()
+    if len(positions) >= max_positions:
         return "Maximum open positions reached"
 
     candidates = [
-        t for t in tokens
+        t for t in st.session_state.tokens
         if t["signal"] == "BUY"
         and t["score"] >= min_score
         and t["liquidity"] >= 5000
-        and t["price"] > 0
-        and "LOW ACTIVITY" not in t["flags"]
-        and "LARGE PRICE DROP" not in t["flags"]
-        and "EXTREME PRICE MOVE" not in t["flags"]
+        and t["volume"] >= 5000
+        and t["change"] < 100
+        and "NO RECORDED SELLS" not in t["flags"]
+        and not on_cooldown(t["address"], cooldown_hours)
     ]
 
     for token in candidates:
-        if len(opened) >= max_positions:
+        if len(open_positions()) >= max_positions:
             break
+        if open_trade(
+            token, amount, True, cooldown_hours
+        ):
+            return "PAPER TRADE OPENED: " + token["symbol"]
 
-        if open_trade(token, amount, auto=True):
-            return "AUTO PAPER TRADE OPENED: " + token["symbol"]
+    return "No token passed Smart Entry filters"
 
-    return "No token passed the Auto Sniper filters"
+# ---------------- MONITOR ----------------
 
-# ---------------- MONITOR POSITIONS ----------------
+def monitor(stop_loss, take_profit):
+    positions = open_positions()
 
-def monitor_trades(stop_loss, take_profit):
-    trades = get_open_trades()
-
-    for _, trade in trades.iterrows():
-        pairs = get_pairs(trade["token_address"])
-        pair = choose_pair(pairs)
-
+    for _, trade in positions.iterrows():
+        pair = best_pair(get_pairs(trade["token_address"]))
         if not pair:
             continue
 
-        price = safe_float(pair.get("priceUsd"))
+        price = number(pair.get("priceUsd"))
         if price <= 0:
             continue
 
-        update_trade_price(int(trade["id"]), price)
+        update_position(int(trade["id"]), price)
 
-        entry = safe_float(trade["entry_price"])
-        pnl_pct = ((price / entry) - 1) * 100 if entry else 0
+        entry = number(trade["entry_price"])
+        pct = ((price / entry) - 1) * 100 if entry else 0
 
-        if pnl_pct <= -stop_loss:
+        if pct <= -stop_loss:
             close_trade(int(trade["id"]), price, "STOP LOSS")
-
-        elif pnl_pct >= take_profit:
+        elif pct >= take_profit:
             close_trade(int(trade["id"]), price, "TAKE PROFIT")
 
-# ---------------- PORTFOLIO SNAPSHOTS ----------------
+# ---------------- SNAPSHOTS ----------------
 
-def save_snapshot():
+def snapshot():
     if time.time() - st.session_state.last_snapshot < 60:
         return
 
-    trades = get_open_trades()
-    cash = get_cash()
-    unrealized = sum(
-        safe_float(x) for x in trades["pnl"]
-    ) if not trades.empty else 0
+    positions = open_positions()
+    unrealized = (
+        sum(positions["pnl"]) if not positions.empty else 0
+    )
+    cash = cash_balance()
 
-    with db() as con:
+    with connect() as con:
         closed = con.execute("""
         SELECT COALESCE(SUM(pnl), 0)
-        FROM sniper_trades_v3
-        WHERE status = 'CLOSED'
+        FROM sniper_trades_v3 WHERE status = 'CLOSED'
         """).fetchone()[0]
 
         con.execute("""
@@ -574,10 +588,10 @@ def save_snapshot():
         (timestamp, portfolio, cash, pnl)
         VALUES (?, ?, ?, ?)
         """, (
-            datetime.now(timezone.utc).isoformat(),
+            now_utc().isoformat(),
             cash + unrealized,
             cash,
-            closed + unrealized
+            number(closed) + unrealized
         ))
         con.commit()
 
@@ -585,149 +599,146 @@ def save_snapshot():
 
 # ---------------- SIDEBAR ----------------
 
-st.sidebar.markdown("## ⚡ GROK SNIPER PRO")
+st.sidebar.markdown("## ⚡ GROK SNIPER V4")
 st.sidebar.caption("SOLANA PAPER TRADING TERMINAL")
 st.sidebar.divider()
 
-st.sidebar.markdown("### RISK MANAGEMENT")
-
-trade_amount = st.sidebar.selectbox(
-    "Paper trade amount",
-    [10, 25, 50, 100],
-    index=1
+amount = st.sidebar.selectbox(
+    "Paper trade amount", [10, 25, 50, 100], index=1
 )
 
 stop_loss = st.sidebar.slider(
-    "Stop loss %",
-    5, 50, 10
+    "Stop loss %", 5, 50, 10
 )
-
 take_profit = st.sidebar.slider(
-    "Take profit %",
-    10, 200, 30
+    "Take profit %", 10, 200, 30
 )
-
 max_positions = st.sidebar.slider(
-    "Maximum open positions",
-    1, 10, 3
+    "Max open positions", 1, 10, 3
 )
-
 min_score = st.sidebar.slider(
-    "Minimum Auto Sniper score",
-    30, 95, 65
+    "Minimum Smart Entry score", 30, 95, 70
+)
+daily_limit = st.sidebar.number_input(
+    "Daily loss limit ($)", min_value=5,
+    max_value=500, value=50, step=5
+)
+cooldown_hours = st.sidebar.slider(
+    "Token cooldown (hours)", 1, 24, 3
 )
 
 st.sidebar.divider()
 st.sidebar.markdown("### AUTO SNIPER")
 
-auto_enabled = st.sidebar.toggle(
+st.session_state.auto_enabled = st.sidebar.toggle(
     "Enable Auto Paper Trading",
     value=st.session_state.auto_enabled
 )
-st.session_state.auto_enabled = auto_enabled
 
 st.sidebar.caption(
-    "Only virtual trades. Auto mode does not buy real tokens."
+    "Virtual trades only. No wallet connection or real purchases."
 )
 
 st.sidebar.divider()
 st.sidebar.markdown("### SYSTEM")
-st.sidebar.write("Scanner interval: 60 seconds")
-st.sidebar.write("UI refresh: 5 seconds")
-st.sidebar.write("Trade checks: 30 seconds")
-st.sidebar.write("AI provider: Not required")
-st.sidebar.write("Network: Solana")
+st.sidebar.write("Scanner: 60 seconds")
+st.sidebar.write("Dashboard: 5 seconds")
+st.sidebar.write("Trade monitor: 30 seconds")
+st.sidebar.write("AI API: Not required")
 
 # ---------------- HEADER ----------------
 
 st.markdown(
-    "<h1>⚡ GROK SOLANA SNIPER <span style='color:#35e6a1'>PRO</span></h1>",
+    "<h1>⚡ GROK SOLANA SNIPER "
+    "<span style='color:#35e6a1'>V4 PRO</span></h1>",
     unsafe_allow_html=True
 )
-st.caption("SMART TOKEN SCANNER  •  RISK FILTERS  •  AUTO PAPER EXECUTION")
-
-# ---------------- REFRESH ----------------
+st.caption(
+    "ANTI SCAM WARNINGS • SMART ENTRY • VOLUME RADAR "
+    "• AUTO PAPER TRADING"
+)
 
 try:
     from streamlit_autorefresh import st_autorefresh
-    st_autorefresh(
-        interval=REFRESH_SECONDS * 1000,
-        key="sniper_refresh"
-    )
+    st_autorefresh(interval=REFRESH, key="v4_refresh")
 except Exception:
     pass
 
-# ---------------- SCAN CONTROL ----------------
+# ---------------- SCAN ----------------
 
-col_scan, col_status = st.columns([1, 3])
+left, right = st.columns([1, 3])
 
-with col_scan:
-    scan_clicked = st.button("⚡ SCAN SOLANA", use_container_width=True)
+with left:
+    scan_clicked = st.button(
+        "⚡ SCAN SOLANA", use_container_width=True
+    )
 
-should_scan = (
-    scan_clicked or
-    time.time() - st.session_state.last_scan >= SCAN_INTERVAL
-)
-
-if should_scan:
-    with st.spinner("Scanning Solana tokens..."):
-        st.session_state.tokens = scan_tokens()
+if (
+    scan_clicked
+    or time.time() - st.session_state.last_scan >= SCAN_INTERVAL
+):
+    with st.spinner("Scanning Solana markets..."):
+        st.session_state.tokens = scan()
         st.session_state.last_scan = time.time()
+        st.session_state.scan_number += 1
         st.session_state.scan_message = (
-            f"Scan complete: {len(st.session_state.tokens)} tokens found"
+            f"Scan complete: {len(st.session_state.tokens)} tokens"
         )
 
-with col_status:
+with right:
     st.markdown(
         f"<p class='terminal'>● SYSTEM ONLINE</p>"
-        f"<p class='small-muted'>{st.session_state.scan_message}</p>",
+        f"<p class='muted'>{st.session_state.scan_message}</p>",
         unsafe_allow_html=True
     )
 
 # ---------------- TRADE MONITOR ----------------
 
-if time.time() - st.session_state.last_trade_check >= TRADE_CHECK_INTERVAL:
-    monitor_trades(stop_loss, take_profit)
+if time.time() - st.session_state.last_trade_check >= TRADE_CHECK:
+    monitor(stop_loss, take_profit)
     st.session_state.last_trade_check = time.time()
 
 # ---------------- AUTO EXECUTION ----------------
 
 if st.session_state.auto_enabled:
-    auto_message = auto_sniper(
-        st.session_state.tokens,
-        trade_amount,
-        max_positions,
-        min_score
-    )
-    st.sidebar.caption(auto_message)
+    if daily_limit_hit(daily_limit):
+        st.session_state.auto_enabled = False
+        st.session_state.last_auto_message = (
+            "Daily loss limit reached. Auto stopped."
+        )
+    elif st.session_state.scan_number > st.session_state.last_auto_scan:
+        st.session_state.last_auto_message = run_auto(
+            amount, max_positions, min_score,
+            daily_limit, cooldown_hours
+        )
+        st.session_state.last_auto_scan = st.session_state.scan_number
 
-save_snapshot()
+st.sidebar.caption(st.session_state.last_auto_message)
+
+snapshot()
 
 # ---------------- METRICS ----------------
 
-open_trades = get_open_trades()
-cash = get_cash()
+positions = open_positions()
+cash = cash_balance()
+unrealized = sum(positions["pnl"]) if not positions.empty else 0
 
-unrealized = (
-    sum(open_trades["pnl"])
-    if not open_trades.empty else 0
-)
-
-with db() as con:
+with connect() as con:
     realized = con.execute("""
     SELECT COALESCE(SUM(pnl), 0)
-    FROM sniper_trades_v3
-    WHERE status = 'CLOSED'
+    FROM sniper_trades_v3 WHERE status = 'CLOSED'
     """).fetchone()[0]
 
-total_pnl = realized + unrealized
+total_pnl = number(realized) + unrealized
 portfolio = cash + unrealized
+today_pnl = realized_today()
 
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("PORTFOLIO VALUE", f"${portfolio:,.2f}")
-m2.metric("AVAILABLE CASH", f"${cash:,.2f}")
-m3.metric("TOTAL P/L", f"${total_pnl:,.2f}")
-m4.metric("OPEN POSITIONS", len(open_trades))
+a, b, c, d, e = st.columns(5)
+a.metric("PORTFOLIO", f"${portfolio:,.2f}")
+b.metric("CASH", f"${cash:,.2f}")
+c.metric("TOTAL P/L", f"${total_pnl:,.2f}")
+d.metric("TODAY P/L", f"${today_pnl:,.2f}")
+e.metric("OPEN POSITIONS", len(positions))
 
 st.divider()
 
@@ -744,116 +755,129 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 # ---------------- MARKET SCANNER ----------------
 
 with tab1:
-    st.subheader("Live Token Scanner")
+    st.subheader("Market Scanner")
 
     tokens = st.session_state.tokens
 
     if tokens:
-        rows = []
-
+        data = []
         for t in tokens:
-            rows.append({
+            data.append({
                 "TOKEN": t["symbol"],
                 "PRICE": t["price"],
                 "LIQUIDITY": t["liquidity"],
-                "24H VOLUME": t["volume"],
-                "24H CHANGE %": t["change"],
+                "VOLUME 24H": t["volume"],
+                "CHANGE %": t["change"],
                 "SCORE": t["score"],
                 "SIGNAL": t["signal"],
                 "VOLUME SPIKE": "YES" if t["spike"] else "NO",
                 "RISK FLAGS": ", ".join(t["flags"]) or "None"
             })
 
-        frame = pd.DataFrame(rows)
-
         st.dataframe(
-            frame,
+            pd.DataFrame(data),
             use_container_width=True,
             hide_index=True,
             column_config={
                 "PRICE": st.column_config.NumberColumn(format="$%.10f"),
                 "LIQUIDITY": st.column_config.NumberColumn(format="$%.0f"),
-                "24H VOLUME": st.column_config.NumberColumn(format="$%.0f"),
-                "24H CHANGE %": st.column_config.NumberColumn(format="%.2f%%"),
+                "VOLUME 24H": st.column_config.NumberColumn(format="$%.0f"),
+                "CHANGE %": st.column_config.NumberColumn(format="%.2f%%"),
                 "SCORE": st.column_config.ProgressColumn(
                     min_value=0, max_value=100
                 )
             }
         )
 
-        st.divider()
-        st.subheader("Token Details")
-
-        selected_symbol = st.selectbox(
-            "Select token",
-            [t["symbol"] + " | " + t["address"][:8] for t in tokens]
-        )
-
-        selected = tokens[
-            [t["symbol"] + " | " + t["address"][:8] for t in tokens]
-            .index(selected_symbol)
+        labels = [
+            f"{t['symbol']} | {t['address'][:8]}"
+            for t in tokens
         ]
 
-        a, b, c, d = st.columns(4)
-        a.metric("MARKET SCORE", f"{selected['score']}/100")
-        b.metric("SIGNAL", selected["signal"])
-        c.metric("LIQUIDITY", f"${selected['liquidity']:,.0f}")
-        d.metric("24H VOLUME", f"${selected['volume']:,.0f}")
+        selected_label = st.selectbox(
+            "Select token", labels
+        )
+        selected = tokens[labels.index(selected_label)]
 
-        st.write("**Risk flags:**", ", ".join(selected["flags"]) or "No detected flags")
-        st.write("**Token address:**", selected["address"])
+        x1, x2, x3, x4 = st.columns(4)
+        x1.metric("SCORE", f"{selected['score']}/100")
+        x2.metric("SIGNAL", selected["signal"])
+        x3.metric("LIQUIDITY", f"${selected['liquidity']:,.0f}")
+        x4.metric("VOLUME", f"${selected['volume']:,.0f}")
+
+        st.write(
+            "**Risk warnings:**",
+            ", ".join(selected["flags"]) or "No detected warnings"
+        )
+        st.write("**Address:**", selected["address"])
+
+        history = get_price_history(selected["address"])
+        if not history.empty:
+            st.markdown("### Token price history")
+            st.line_chart(
+                history.set_index("timestamp")["price"]
+            )
 
         if selected["url"]:
             st.link_button("OPEN DEXSCREENER", selected["url"])
 
-        if st.button("OPEN PAPER TRADE", key="manual_open"):
+        if st.button("OPEN PAPER TRADE", key="v4_manual_open"):
             if selected["signal"] != "BUY":
-                st.warning("This token is not currently rated BUY. You can still review it.")
+                st.warning(
+                    "Smart Entry does not currently rate this token BUY."
+                )
+            elif open_trade(
+                selected, amount, False, cooldown_hours
+            ):
+                st.success("Paper trade opened!")
             else:
-                if open_trade(selected, trade_amount):
-                    st.success("Paper trade opened!")
-                else:
-                    st.error("Trade could not be opened. Check available cash or open positions.")
-
+                st.error(
+                    "Could not open trade. Check cash, cooldown or existing position."
+                )
     else:
-        st.info("No tokens found yet. Press SCAN SOLANA.")
+        st.info("No tokens found. Press SCAN SOLANA.")
 
 # ---------------- OPEN POSITIONS ----------------
 
 with tab2:
-    st.subheader("Open Paper Positions")
+    st.subheader("Open Positions")
 
-    open_trades = get_open_trades()
+    positions = open_positions()
 
-    if open_trades.empty:
-        st.info("No open positions.")
+    if positions.empty:
+        st.info("No open paper positions.")
     else:
         st.dataframe(
-            open_trades[[
+            positions[[
                 "id", "symbol", "entry_price",
-                "current_price", "amount", "pnl", "pnl_pct",
-                "entry_time", "auto_trade"
+                "current_price", "amount", "pnl",
+                "pnl_pct", "entry_time", "auto_trade"
             ]],
             use_container_width=True,
             hide_index=True
         )
 
-        for _, trade in open_trades.iterrows():
+        for _, trade in positions.iterrows():
             with st.container(border=True):
-                left, right = st.columns([3, 1])
-                left.markdown(f"**{trade['symbol']}**  ·  Trade #{trade['id']}")
-                left.write(
-                    f"Entry ${trade['entry_price']:.10f}  |  "
-                    f"Current ${trade['current_price']:.10f}"
+                l, r = st.columns([3, 1])
+                l.markdown(
+                    f"**{trade['symbol']}** · Trade #{trade['id']}"
                 )
-                left.write(
-                    f"P/L: ${trade['pnl']:.2f} ({trade['pnl_pct']:.2f}%)"
+                l.write(
+                    f"Entry: ${trade['entry_price']:.10f} | "
+                    f"Current: ${trade['current_price']:.10f}"
+                )
+                l.write(
+                    f"P/L: ${trade['pnl']:.2f} "
+                    f"({trade['pnl_pct']:.2f}%)"
                 )
 
-                if right.button("CLOSE TRADE", key=f"close_{trade['id']}"):
+                if r.button(
+                    "CLOSE TRADE", key=f"v4_close_{trade['id']}"
+                ):
                     close_trade(
                         int(trade["id"]),
-                        safe_float(trade["current_price"]),
+                        number(trade["current_price"]),
                         "MANUAL"
                     )
                     st.rerun()
@@ -861,44 +885,47 @@ with tab2:
 # ---------------- AUTO SNIPER ----------------
 
 with tab3:
-    st.subheader("Smart Auto Sniper")
+    st.subheader("Smart Auto Sniper V4")
 
     if st.session_state.auto_enabled:
         st.success("AUTO PAPER TRADING ENABLED")
     else:
-        st.warning("Auto Paper Trading is disabled")
+        st.warning("AUTO PAPER TRADING DISABLED")
 
-    st.write(
-        "The system scans tokens and checks their local market score, "
-        "liquidity, trading activity and risk flags."
-    )
+    st.write("**Latest Auto Sniper status:**")
+    st.code(st.session_state.last_auto_message)
 
-    st.markdown("### Execution rules")
+    st.markdown("### Smart Entry rules")
     st.write(f"- Minimum score: {min_score}/100")
-    st.write(f"- Paper amount: ${trade_amount}")
-    st.write(f"- Maximum open positions: {max_positions}")
-    st.write(f"- Stop loss: -{stop_loss}%")
-    st.write(f"- Take profit: +{take_profit}%")
+    st.write("- Minimum liquidity: $5,000")
+    st.write("- Minimum 24h volume: $5,000")
+    st.write("- Minimum trading activity: 10 transactions")
+    st.write("- Avoids extreme price moves")
+    st.write(f"- Token cooldown: {cooldown_hours} hours")
+    st.write(f"- Daily loss limit: ${daily_limit:.2f}")
 
-    st.markdown("### Current candidates")
+    if daily_limit_hit(daily_limit):
+        st.error("Daily loss limit reached. Auto trading is stopped.")
 
+    st.markdown("### BUY candidates")
     candidates = [
         t for t in st.session_state.tokens
         if t["signal"] == "BUY"
     ]
 
     if candidates:
-        for t in candidates[:5]:
+        for token in candidates[:8]:
             st.write(
-                f"**{t['symbol']}**  |  Score {t['score']}  |  "
-                f"Liquidity ${t['liquidity']:,.0f}"
+                f"**{token['symbol']}** | Score {token['score']} "
+                f"| Liquidity ${token['liquidity']:,.0f} "
+                f"| Volume ${token['volume']:,.0f}"
             )
     else:
-        st.info("No tokens currently pass the BUY filters.")
+        st.info("No tokens currently pass the Smart Entry filters.")
 
     st.caption(
-        "Important: risk flags are basic warning signals, not a verified "
-        "honeypot or rug-pull detector. A BUY signal is not a prediction."
+        "Anti Scam checks are warning heuristics only. "
+        "They cannot prove a token is safe or detect every honeypot."
     )
 
 # ---------------- ANALYTICS ----------------
@@ -906,7 +933,7 @@ with tab3:
 with tab4:
     st.subheader("Performance Analytics")
 
-    with db() as con:
+    with connect() as con:
         history = pd.read_sql_query("""
         SELECT * FROM sniper_trades_v3
         WHERE status = 'CLOSED'
@@ -918,42 +945,46 @@ with tab4:
         ORDER BY id ASC
         """, con)
 
-    x1, x2, x3 = st.columns(3)
-
     if not history.empty:
         wins = int((history["pnl"] > 0).sum())
         losses = int((history["pnl"] <= 0).sum())
         winrate = wins / len(history) * 100
 
-        x1.metric("CLOSED TRADES", len(history))
-        x2.metric("WIN RATE", f"{winrate:.1f}%")
-        x3.metric("WINS / LOSSES", f"{wins} / {losses}")
+        p1, p2, p3 = st.columns(3)
+        p1.metric("CLOSED TRADES", len(history))
+        p2.metric("WIN RATE", f"{winrate:.1f}%")
+        p3.metric("WINS / LOSSES", f"{wins} / {losses}")
 
-        st.markdown("### Closed trade P/L")
+        st.markdown("### Profit and loss")
         st.bar_chart(history.set_index("id")["pnl"])
+
+        st.markdown("### Cumulative P/L")
+        history["cumulative_pnl"] = history["pnl"].cumsum()
+        st.line_chart(
+            history.set_index("id")["cumulative_pnl"]
+        )
     else:
-        x1.metric("CLOSED TRADES", 0)
-        x2.metric("WIN RATE", "0%")
-        x3.metric("WINS / LOSSES", "0 / 0")
-        st.info("Analytics will appear after trades are closed.")
+        st.info("Close some trades to see performance analytics.")
 
     if not snapshots.empty:
         st.markdown("### Portfolio history")
-        st.line_chart(snapshots.set_index("timestamp")["portfolio"])
+        st.line_chart(
+            snapshots.set_index("timestamp")["portfolio"]
+        )
 
 # ---------------- TRADE HISTORY ----------------
 
 with tab5:
     st.subheader("Trade History")
 
-    with db() as con:
+    with connect() as con:
         all_trades = pd.read_sql_query("""
         SELECT * FROM sniper_trades_v3
         ORDER BY id DESC
         """, con)
 
     if all_trades.empty:
-        st.info("No trades yet.")
+        st.info("No trade history yet.")
     else:
         st.dataframe(
             all_trades[[
@@ -969,7 +1000,7 @@ with tab5:
 
 st.divider()
 st.markdown(
-    "<p class='small-muted'>GROK SOLANA SNIPER PRO V3 · "
+    "<p class='muted'>GROK SOLANA SNIPER V4 PRO · "
     "PAPER TRADING ONLY · NOT FINANCIAL ADVICE</p>",
     unsafe_allow_html=True
 )
