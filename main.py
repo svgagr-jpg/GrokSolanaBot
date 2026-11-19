@@ -3,8 +3,8 @@ import streamlit as st
 import requests
 import sqlite3
 import pandas as pd
-import json
 import time
+import math
 from datetime import datetime
 from streamlit_autorefresh import st_autorefresh
 
@@ -20,12 +20,13 @@ st.set_page_config(
 )
 
 DB = "bot.db"
-MODEL = "gemini-3.8-flash"
 STARTING_CASH = 1000.0
 REFRESH_MS = 5000
+STOP_LOSS = -10
+TAKE_PROFIT = 30
 
 # =========================
-# PREMIUM DESIGN
+# DESIGN
 # =========================
 
 st.markdown("""
@@ -33,55 +34,37 @@ st.markdown("""
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
 
 html, body, [class*="css"] {
-    font-family: 'Inter', sans-serif;
+    font-family: Inter, sans-serif;
 }
-
 .stApp {
-    background:
-        radial-gradient(ellipse at 20% 0%, #10251d 0%, transparent 40%),
-        #080d12;
+    background: radial-gradient(ellipse at 20% 0%, #10251d 0%, transparent 40%), #080d12;
     color: #e8f2ee;
 }
-
-header[data-testid="stHeader"] {
-    background: rgba(8,13,18,0.9);
-}
-
 section[data-testid="stSidebar"] {
     background: #0c1518;
     border-right: 1px solid #1b3930;
 }
-
 .block-container {
     padding-top: 2rem;
     max-width: 1500px;
 }
-
 h1, h2, h3 {
     color: #eafff4 !important;
     font-weight: 800 !important;
 }
-
-p, label, span {
-    color: #c5d5ce;
-}
-
 div[data-testid="stMetric"] {
     background: linear-gradient(145deg,#12231e,#0d1717);
     border: 1px solid #244b3b;
     padding: 19px;
     border-radius: 15px;
 }
-
 div[data-testid="stMetricValue"] {
     color: #55f2a0 !important;
     font-weight: 800;
 }
-
 div[data-testid="stMetricLabel"] {
     color: #9bb7a9 !important;
 }
-
 .stButton > button {
     background: linear-gradient(90deg,#00bd76,#37ed9b);
     color: #06140e !important;
@@ -89,35 +72,11 @@ div[data-testid="stMetricLabel"] {
     border: none;
     border-radius: 10px;
     min-height: 42px;
-    transition: 0.2s;
 }
-
 .stButton > button:hover {
     background: #72ffb6;
-    border: none;
     color: #06140e !important;
-    transform: scale(1.01);
 }
-
-div[data-testid="stDataFrame"] {
-    border: 1px solid #234536;
-    border-radius: 12px;
-    overflow: hidden;
-}
-
-div[data-testid="stTabs"] button {
-    color: #9fb8aa;
-    font-weight: 700;
-}
-
-div[data-testid="stTabs"] button[aria-selected="true"] {
-    color: #53f5a0;
-}
-
-hr {
-    border-color: #254638;
-}
-
 .terminal-header {
     background: linear-gradient(110deg,#10271e,#10201f,#101820);
     border: 1px solid #286044;
@@ -125,29 +84,24 @@ hr {
     border-radius: 18px;
     margin-bottom: 20px;
 }
-
 .terminal-label {
     color: #5df5a5;
     font-size: 12px;
     letter-spacing: 3px;
     font-weight: 800;
 }
-
 .terminal-title {
     color: #effff5;
     font-size: 32px;
     font-weight: 800;
     margin-top: 8px;
 }
-
 .terminal-subtitle {
     color: #91ad9e;
     font-size: 13px;
 }
-
-.status-dot {
-    color: #52f59e;
-    font-weight: 800;
+hr {
+    border-color: #254638;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -180,17 +134,15 @@ CREATE TABLE IF NOT EXISTS portfolio_snapshots_v2 (
     value REAL
 )
 """)
-
 con.commit()
 
 # =========================
-# HELPERS
+# DATA HELPERS
 # =========================
 
 def get_positions():
     return pd.read_sql_query(
-        "SELECT * FROM paper_trades_v2 ORDER BY id DESC",
-        con
+        "SELECT * FROM paper_trades_v2 ORDER BY id DESC", con
     )
 
 def get_cash():
@@ -200,10 +152,10 @@ def get_cash():
 
 def get_price(address):
     url = f"https://api.dexscreener.com/token-pairs/v1/solana/{address}"
-    response = requests.get(url, timeout=15)
-    response.raise_for_status()
+    r = requests.get(url, timeout=15)
+    r.raise_for_status()
+    pairs = r.json()
 
-    pairs = response.json()
     if not pairs:
         return None
 
@@ -211,87 +163,57 @@ def get_price(address):
         pairs,
         key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0)
     )
-
     return float(pair.get("priceUsd") or 0)
 
 # =========================
-# GEMINI AI
+# LOCAL TOKEN SCORING
 # =========================
 
-def gemini(prompt):
-    try:
-        key = st.secrets["GEMINI_API_KEY"]
-    except Exception:
-        raise Exception("GEMINI_API_KEY ni nastavljen v Secrets.")
+def calculate_score(token):
+    liquidity = max(0, token["liquidity"])
+    volume = max(0, token["volume"])
+    change = token["change"]
 
-    url = (
-        "https://generativelanguage.googleapis.com/"
-        f"v1beta/models/{MODEL}:generateContent"
+    # Liquidity: maximum 40 points
+    liquidity_score = min(liquidity / 2500, 40)
+
+    # Volume relative to liquidity: maximum 30 points
+    if liquidity > 0:
+        ratio = volume / liquidity
+        volume_score = min(ratio / 1.5, 1) * 30
+    else:
+        volume_score = 0
+
+    # Momentum: maximum 20 points
+    if 0 <= change <= 20:
+        momentum_score = 10 + change / 2
+    elif -10 <= change < 0:
+        momentum_score = max(0, 10 + change)
+    elif 20 < change <= 50:
+        momentum_score = max(0, 20 - (change - 20) / 3)
+    elif change > 50:
+        momentum_score = max(0, 10 - (change - 50) / 10)
+    else:
+        momentum_score = max(0, 10 + change / 2)
+
+    # Penalize unusually extreme price moves
+    if abs(change) > 100:
+        momentum_score *= 0.4
+
+    score = round(
+        liquidity_score + volume_score + momentum_score
     )
 
-    response = requests.post(
-        url,
-        headers={
-            "Content-Type": "application/json",
-            "X-goog-api-key": key
-        },
-        json={
-            "contents": [
-                {"parts": [{"text": prompt}]}
-            ],
-            "generationConfig": {
-                "temperature": 0.2
-            }
-        },
-        timeout=45
-    )
+    return max(0, min(100, score))
 
-    if response.status_code != 200:
-        raise Exception(
-            f"Gemini {response.status_code}: {response.text[:350]}"
-        )
-
-    return response.json()["candidates"][0]["content"]["parts"][0]["text"]
-
-def test_gemini():
-    return gemini("Reply with exactly OK")
-
-def analyze_tokens(tokens):
-    compact = [
-        {
-            "symbol": t["symbol"],
-            "liquidity": t["liquidity"],
-            "volume_24h": t["volume"],
-            "change_24h": t["change"]
-        }
-        for t in tokens
-    ]
-
-    prompt = """
-You are an experimental Solana token analysis assistant.
-
-Analyze ONLY the supplied metrics.
-Do not invent facts.
-Score each token from 0 to 100.
-Explain the score briefly.
-This is not financial advice.
-
-Return ONLY JSON:
-{"scores":[
-{"symbol":"ABC","score":50,"reason":"Short explanation"}
-]}
-
-DATA:
-""" + json.dumps(compact)
-
-    raw = gemini(prompt)
-    raw = raw.replace("```json", "").replace("```", "").strip()
-
-    data = json.loads(raw)
-    return {
-        x["symbol"]: x
-        for x in data.get("scores", [])
-    }
+def score_label(score):
+    if score >= 75:
+        return "High market score"
+    elif score >= 50:
+        return "Medium market score"
+    elif score >= 30:
+        return "Low market score"
+    return "Very low market score"
 
 # =========================
 # SOLANA SCANNER
@@ -299,10 +221,10 @@ DATA:
 
 def scan_solana():
     url = "https://api.dexscreener.com/token-profiles/latest/v1"
-    response = requests.get(url, timeout=20)
-    response.raise_for_status()
+    r = requests.get(url, timeout=20)
+    r.raise_for_status()
 
-    profiles = response.json()
+    profiles = r.json()
     tokens = []
     seen = set()
 
@@ -311,7 +233,6 @@ def scan_solana():
             continue
 
         address = profile.get("tokenAddress")
-
         if not address or address in seen:
             continue
 
@@ -321,24 +242,25 @@ def scan_solana():
             pair_url = (
                 f"https://api.dexscreener.com/token-pairs/v1/solana/{address}"
             )
-            r = requests.get(pair_url, timeout=15)
-            r.raise_for_status()
+            pr = requests.get(pair_url, timeout=15)
+            pr.raise_for_status()
+            pairs = pr.json()
 
-            pairs = r.json()
             if not pairs:
                 continue
 
             pair = max(
                 pairs,
-                key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0)
+                key=lambda p: float(
+                    (p.get("liquidity") or {}).get("usd") or 0
+                )
             )
 
             price = float(pair.get("priceUsd") or 0)
-
             if price <= 0:
                 continue
 
-            tokens.append({
+            token = {
                 "name": (pair.get("baseToken") or {}).get("name", "Unknown"),
                 "symbol": (pair.get("baseToken") or {}).get("symbol", "?"),
                 "address": address,
@@ -352,10 +274,12 @@ def scan_solana():
                 "change": float(
                     (pair.get("priceChange") or {}).get("h24") or 0
                 ),
-                "score": None,
-                "reason": "Waiting for Gemini",
                 "url": pair.get("url", "")
-            })
+            }
+
+            token["score"] = calculate_score(token)
+            token["reason"] = score_label(token["score"])
+            tokens.append(token)
 
         except Exception:
             continue
@@ -388,7 +312,6 @@ def open_trade(token, amount):
         "OPEN",
         datetime.now().isoformat()
     ))
-
     con.commit()
     return True, "Paper trade opened"
 
@@ -420,7 +343,6 @@ def close_trade(trade_id):
             datetime.now().isoformat(),
             trade_id
         ))
-
         con.commit()
 
     except Exception:
@@ -433,23 +355,21 @@ def monitor_trades():
     for _, trade in opened.iterrows():
         try:
             current = get_price(trade["address"])
-
             if not current or not trade["entry"]:
                 continue
 
-            change = current / trade["entry"] - 1
+            change = (current / trade["entry"] - 1) * 100
 
-            if change <= -0.10 or change >= 0.30:
+            if change <= STOP_LOSS or change >= TAKE_PROFIT:
                 close_trade(int(trade["id"]))
 
         except Exception:
             continue
 
 def calculate_portfolio():
-    df = get_positions()
-    opened = df[df["status"] == "OPEN"]
-
     total = get_cash()
+    opened = get_positions()
+    opened = opened[opened["status"] == "OPEN"]
 
     for _, trade in opened.iterrows():
         try:
@@ -467,12 +387,15 @@ def calculate_portfolio():
 # AUTO REFRESH
 # =========================
 
-st_autorefresh(
-    interval=REFRESH_MS,
-    key="terminal_refresh"
-)
+st_autorefresh(interval=REFRESH_MS, key="terminal_refresh")
 
-monitor_trades()
+# Check stop loss and take profit at most every 30 seconds
+now = time.time()
+last_check = st.session_state.get("last_trade_check", 0)
+
+if now - last_check >= 30:
+    monitor_trades()
+    st.session_state.last_trade_check = now
 
 # =========================
 # HEADER
@@ -483,10 +406,10 @@ st.markdown("""
     <div class="terminal-label">SOLANA NETWORK / PAPER TRADING</div>
     <div class="terminal-title">SOLANA TERMINAL</div>
     <div class="terminal-subtitle">
-        AI MARKET INTELLIGENCE • TOKEN SCANNER • PORTFOLIO ANALYTICS
+        MARKET SCANNER • LOCAL SCORING • PORTFOLIO ANALYTICS
     </div>
     <br>
-    <span class="status-dot">● SYSTEM ONLINE</span>
+    <span style="color:#52f59e;font-weight:800">● SYSTEM ONLINE</span>
 </div>
 """, unsafe_allow_html=True)
 
@@ -497,7 +420,6 @@ st.markdown("""
 with st.sidebar:
     st.markdown("## SOLANA TERMINAL")
     st.caption("PAPER TRADING SYSTEM")
-
     st.divider()
 
     st.markdown("### Risk settings")
@@ -505,25 +427,16 @@ with st.sidebar:
     st.metric("Take profit", "+30%")
 
     st.divider()
-
     st.markdown("### System")
-    st.write("Refresh: 10 seconds")
+    st.write("Refresh: 5 seconds")
+    st.write("Trade checks: 30 seconds")
     st.write("Network: Solana")
     st.write("Mode: Paper only")
-    st.write("AI: Gemini")
-
+    st.write("Scoring: Local algorithm")
     st.divider()
 
-    if st.button("TEST GEMINI"):
-        with st.spinner("Testing AI..."):
-            try:
-                answer = test_gemini()
-                st.success(answer)
-            except Exception as e:
-                st.error(str(e))
-
 # =========================
-# PORTFOLIO METRICS
+# PORTFOLIO
 # =========================
 
 portfolio = calculate_portfolio()
@@ -537,7 +450,6 @@ closed = df[df["status"] == "CLOSED"]
 st.markdown("### PORTFOLIO OVERVIEW")
 
 m1, m2, m3, m4 = st.columns(4)
-
 m1.metric("Portfolio value", f"${portfolio:,.2f}")
 m2.metric("Available cash", f"${cash:,.2f}")
 m3.metric("Total P/L", f"${profit:,.2f}")
@@ -562,7 +474,7 @@ tab1, tab2, tab3, tab4 = st.tabs([
 
 with tab1:
     st.markdown("### LIVE SOLANA TOKEN SCANNER")
-    st.caption("Latest token profiles from DexScreener")
+    st.caption("Market data supplied by DexScreener")
 
     if "tokens" not in st.session_state:
         st.session_state.tokens = []
@@ -570,46 +482,17 @@ with tab1:
     if "scan_error" not in st.session_state:
         st.session_state.scan_error = ""
 
-    col1, col2 = st.columns([1, 3])
-
-    with col1:
-        scan_button = st.button(
-            "SCAN SOLANA",
-            type="primary",
-            use_container_width=True
-        )
-
-    with col2:
-        st.caption("Fetch tokens and request Gemini analysis")
-
-    if scan_button:
+    if st.button("SCAN SOLANA", type="primary"):
         st.session_state.tokens = []
         st.session_state.scan_error = ""
 
-        with st.spinner("Scanning Solana..."):
+        with st.spinner("Scanning Solana tokens..."):
             try:
-                found = scan_solana()
-
-                if not found:
-                    raise Exception("No Solana tokens found.")
-
-                st.session_state.tokens = found
-
-                try:
-                    scores = analyze_tokens(found)
-
-                    for token in st.session_state.tokens:
-                        result = scores.get(token["symbol"], {})
-                        token["score"] = result.get("score")
-                        token["reason"] = result.get(
-                            "reason", "No Gemini explanation"
-                        )
-
-                except Exception as e:
+                st.session_state.tokens = scan_solana()
+                if not st.session_state.tokens:
                     st.session_state.scan_error = (
-                        "Gemini analysis unavailable: " + str(e)
+                        "No tokens found. Try again later."
                     )
-
             except Exception as e:
                 st.session_state.scan_error = str(e)
 
@@ -621,19 +504,16 @@ with tab1:
     if tokens:
         rows = []
 
-        for token in tokens:
+        for t in tokens:
             rows.append({
-                "Token": token["name"],
-                "Symbol": token["symbol"],
-                "Price": token["price"],
-                "Liquidity": token["liquidity"],
-                "Volume 24h": token["volume"],
-                "Change 24h %": token["change"],
-                "Gemini score": (
-                    token["score"]
-                    if token["score"] is not None
-                    else "Waiting"
-                )
+                "Token": t["name"],
+                "Symbol": t["symbol"],
+                "Price": t["price"],
+                "Liquidity": t["liquidity"],
+                "Volume 24h": t["volume"],
+                "Change 24h %": t["change"],
+                "Market score": t["score"],
+                "Rating": t["reason"]
             })
 
         st.dataframe(
@@ -642,7 +522,10 @@ with tab1:
             hide_index=True
         )
 
-        st.markdown("### SELECT TOKEN")
+        st.caption(
+            "Market score is a simple indicator based on liquidity, "
+            "volume and price movement. It is not an AI prediction."
+        )
 
         choices = [
             f"{i+1}. {t['symbol']} — {t['name']}"
@@ -650,17 +533,13 @@ with tab1:
         ]
 
         selected = st.selectbox("Choose a token", choices)
-        selected_index = choices.index(selected)
-        token = tokens[selected_index]
+        index = choices.index(selected)
+        token = tokens[index]
 
         c1, c2, c3 = st.columns(3)
-
         c1.metric("Price", f"${token['price']:.8f}")
         c2.metric("Liquidity", f"${token['liquidity']:,.2f}")
-        c3.metric(
-            "Gemini score",
-            str(token["score"]) if token["score"] is not None else "Waiting"
-        )
+        c3.metric("Market score", f"{token['score']}/100")
 
         st.info(token["reason"])
 
@@ -675,7 +554,6 @@ with tab1:
 
         if st.button("OPEN PAPER TRADE", type="primary"):
             success, message = open_trade(token, amount)
-
             if success:
                 st.success(message)
                 st.rerun()
@@ -691,6 +569,9 @@ with tab1:
 
 with tab2:
     st.markdown("### ACTIVE PAPER POSITIONS")
+
+    df = get_positions()
+    opened = df[df["status"] == "OPEN"]
 
     if not opened.empty:
         display = []
@@ -713,7 +594,6 @@ with tab2:
                     "P/L $": round(pnl, 2),
                     "Invested": trade["amount"]
                 })
-
             except Exception:
                 continue
 
@@ -724,16 +604,14 @@ with tab2:
                 hide_index=True
             )
 
-        trade_ids = opened["id"].astype(int).tolist()
-
         selected_id = st.selectbox(
-            "Select position to close manually",
-            trade_ids
+            "Select position to close",
+            opened["id"].astype(int).tolist()
         )
 
         if st.button("CLOSE SELECTED PAPER TRADE"):
             close_trade(int(selected_id))
-            st.success("Paper position closed.")
+            st.success("Paper trade closed.")
             st.rerun()
 
     else:
@@ -747,13 +625,11 @@ with tab3:
     st.markdown("### PORTFOLIO ANALYTICS")
 
     df = get_positions()
-    opened = df[df["status"] == "OPEN"]
     closed = df[df["status"] == "CLOSED"]
 
     a, b, c = st.columns(3)
-
     a.metric("Total trades", len(df))
-    b.metric("Open trades", len(opened))
+    b.metric("Open trades", len(df[df["status"] == "OPEN"]))
     c.metric("Closed trades", len(closed))
 
     if not closed.empty:
@@ -767,13 +643,10 @@ with tab3:
         c.metric("Win rate", f"{win_rate:.1f}%")
 
         st.markdown("### CLOSED TRADE P/L")
-
-        chart_data = closed[["token", "pnl"]].copy()
-        chart_data = chart_data.set_index("token")
-        st.bar_chart(chart_data)
+        st.bar_chart(closed.set_index("token")["pnl"])
 
     else:
-        st.info("Your analytics will appear after closing trades.")
+        st.info("Analytics will appear after closing trades.")
 
     st.markdown("### PORTFOLIO VALUE HISTORY")
 
@@ -811,23 +684,25 @@ with tab4:
         st.info("No trade history yet.")
 
 # =========================
-# SNAPSHOT
+# PORTFOLIO SNAPSHOT
 # =========================
 
-con.execute(
-    "INSERT INTO portfolio_snapshots_v2 (time,value) VALUES (?,?)",
-    (datetime.now().strftime("%H:%M:%S"), portfolio)
-)
-con.commit()
+if time.time() - st.session_state.get("last_snapshot", 0) >= 60:
+    con.execute(
+        "INSERT INTO portfolio_snapshots_v2 (time,value) VALUES (?,?)",
+        (datetime.now().strftime("%H:%M:%S"), portfolio)
+    )
+    con.commit()
+    st.session_state.last_snapshot = time.time()
 
 # =========================
 # FOOTER
 # =========================
 
 st.divider()
-
 st.caption(
     "SOLANA TERMINAL • PAPER TRADING ONLY • "
-    "Gemini scores are experimental. "
-    "Stop loss and take profit are checked on refresh and are not guaranteed execution prices."
+    "Local market scoring is experimental. "
+    "Stop loss and take profit are checked every 30 seconds, "
+    "not guaranteed execution prices."
 )
