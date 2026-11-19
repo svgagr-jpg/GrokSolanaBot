@@ -14,70 +14,50 @@ MODEL = "gemini-3.8-flash"
 DB = "bot.db"
 STARTING_CASH = 1000.0
 
-def db():
-    con = sqlite3.connect(DB, check_same_thread=False)
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS paper_trades_v2 (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            token TEXT,
-            address TEXT,
-            entry REAL,
-            amount REAL,
-            status TEXT,
-            exit REAL,
-            pnl REAL,
-            opened TEXT,
-            closed TEXT
-        )
-    """)
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS portfolio_snapshots_v2 (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            time TEXT,
-            value REAL
-        )
-    """)
-    con.commit()
-    return con
+con = sqlite3.connect(DB, check_same_thread=False)
+con.execute("""
+CREATE TABLE IF NOT EXISTS paper_trades_v2 (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    token TEXT, address TEXT, entry REAL, amount REAL,
+    status TEXT, exit REAL, pnl REAL, opened TEXT, closed TEXT
+)
+""")
+con.execute("""
+CREATE TABLE IF NOT EXISTS portfolio_snapshots_v2 (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    time TEXT, value REAL
+)
+""")
+con.commit()
 
-con = db()
-
-def gemini_key():
+def get_key():
     try:
         return st.secrets["GEMINI_API_KEY"]
     except Exception:
         return ""
 
 def ask_gemini(prompt):
-    key = gemini_key()
+    key = get_key()
     if not key:
         raise Exception("GEMINI_API_KEY manjka v Streamlit Secrets.")
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
-    response = requests.post(
+    r = requests.post(
         url,
-        headers={
-            "Content-Type": "application/json",
-            "X-goog-api-key": key
-        },
-        json={
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0.2}
-        },
+        headers={"Content-Type": "application/json", "X-goog-api-key": key},
+        json={"contents": [{"parts": [{"text": prompt}]}]},
         timeout=45
     )
-
-    if response.status_code != 200:
-        raise Exception(f"Gemini napaka {response.status_code}: {response.text[:500]}")
-
-    data = response.json()
-    return data["candidates"][0]["content"]["parts"][0]["text"]
+    if r.status_code != 200:
+        raise Exception(f"Gemini napaka {r.status_code}: {r.text[:400]}")
+    return r.json()["candidates"][0]["content"]["parts"][0]["text"]
 
 def get_tokens():
-    url = "https://api.dexscreener.com/token-profiles/latest/v1"
-    r = requests.get(url, timeout=20)
+    r = requests.get(
+        "https://api.dexscreener.com/token-profiles/latest/v1",
+        timeout=20
+    )
     r.raise_for_status()
-
     profiles = r.json()
     tokens = []
     seen = set()
@@ -89,15 +69,13 @@ def get_tokens():
         address = profile.get("tokenAddress")
         if not address or address in seen:
             continue
-
         seen.add(address)
 
         try:
-            pair_url = f"https://api.dexscreener.com/token-pairs/v1/solana/{address}"
-            pr = requests.get(pair_url, timeout=15)
+            url = f"https://api.dexscreener.com/token-pairs/v1/solana/{address}"
+            pr = requests.get(url, timeout=15)
             pr.raise_for_status()
             pairs = pr.json()
-
             if not pairs:
                 continue
 
@@ -106,25 +84,22 @@ def get_tokens():
                 key=lambda x: float((x.get("liquidity") or {}).get("usd") or 0)
             )
 
-            liquidity = float((pair.get("liquidity") or {}).get("usd") or 0)
-            volume = float((pair.get("volume") or {}).get("h24") or 0)
             price = float(pair.get("priceUsd") or 0)
-            change = float((pair.get("priceChange") or {}).get("h24") or 0)
-
             if price <= 0:
                 continue
 
             tokens.append({
-                "name": (pair.get("baseToken") or {}).get("name", "Unknown"),
-                "symbol": (pair.get("baseToken") or {}).get("symbol", "?"),
-                "address": address,
-                "price": price,
-                "liquidity": liquidity,
-                "volume": volume,
-                "change": change,
-                "url": pair.get("url", "")
+                "Name": (pair.get("baseToken") or {}).get("name", "Unknown"),
+                "Symbol": (pair.get("baseToken") or {}).get("symbol", "?"),
+                "Address": address,
+                "Price ($)": price,
+                "Liquidity ($)": float((pair.get("liquidity") or {}).get("usd") or 0),
+                "Volume 24h ($)": float((pair.get("volume") or {}).get("h24") or 0),
+                "Change 24h (%)": float((pair.get("priceChange") or {}).get("h24") or 0),
+                "Gemini score": 0,
+                "Reason": "Čaka na Gemini analizo",
+                "URL": pair.get("url", "")
             })
-
         except Exception:
             continue
 
@@ -133,34 +108,33 @@ def get_tokens():
 
     return tokens
 
-def ai_scores(tokens):
-    compact = []
-    for t in tokens:
-        compact.append({
-            "symbol": t["symbol"],
-            "liquidity_usd": t["liquidity"],
-            "volume_24h_usd": t["volume"],
-            "change_24h_percent": t["change"]
-        })
+def analyze_tokens(tokens):
+    compact = [
+        {
+            "symbol": t["Symbol"],
+            "liquidity_usd": t["Liquidity ($)"],
+            "volume_24h_usd": t["Volume 24h ($)"],
+            "change_24h_percent": t["Change 24h (%)"]
+        }
+        for t in tokens
+    ]
 
     prompt = """
-Analyze these Solana meme coins using ONLY the supplied numbers.
-This is experimental paper-trading analysis, not financial advice.
+Analyze these Solana tokens using only the supplied numbers.
 Give each token a risk score from 0 to 100.
-Do not invent information.
-Return ONLY valid JSON in this format:
+Return ONLY JSON:
 {"scores":[{"symbol":"TOKEN","score":50,"reason":"Short reason"}]}
-
 Tokens:
 """ + json.dumps(compact)
 
-    raw = ask_gemini(prompt)
-    raw = raw.replace("```json", "").replace("```", "").strip()
-    result = json.loads(raw)
-    return {
-        x["symbol"]: x
-        for x in result.get("scores", [])
-    }
+    raw = ask_gemini(prompt).replace("```json", "").replace("```", "").strip()
+    results = json.loads(raw).get("scores", [])
+    scores = {x["symbol"]: x for x in results}
+
+    for token in tokens:
+        result = scores.get(token["Symbol"], {})
+        token["Gemini score"] = result.get("score", 0)
+        token["Reason"] = result.get("reason", "Brez ocene")
 
 def price_for(address):
     url = f"https://api.dexscreener.com/token-pairs/v1/solana/{address}"
@@ -175,79 +149,60 @@ def price_for(address):
     )
     return float(pair.get("priceUsd") or 0)
 
-def get_cash():
-    trades = pd.read_sql_query(
-        "SELECT amount FROM paper_trades_v2 WHERE status='OPEN'", con
-    )
-    return STARTING_CASH - trades["amount"].sum()
-
-def get_positions():
+def positions():
     return pd.read_sql_query(
         "SELECT * FROM paper_trades_v2 ORDER BY id DESC", con
     )
 
-def snapshot():
-    positions = get_positions()
-    cash = get_cash()
-    total = cash
-
-    for _, trade in positions[positions["status"] == "OPEN"].iterrows():
-        try:
-            current = price_for(trade["address"])
-            if current:
-                total += trade["amount"] * current / trade["entry"]
-            else:
-                total += trade["amount"]
-        except Exception:
-            total += trade["amount"]
-
-    con.execute(
-        "INSERT INTO portfolio_snapshots_v2 (time,value) VALUES (?,?)",
-        (datetime.now().strftime("%H:%M:%S"), total)
-    )
-    con.commit()
+def cash_left():
+    open_trades = positions()
+    open_trades = open_trades[open_trades["status"] == "OPEN"]
+    return STARTING_CASH - open_trades["amount"].sum()
 
 def check_trades():
-    positions = get_positions()
-    for _, trade in positions[positions["status"] == "OPEN"].iterrows():
+    for _, trade in positions().query("status == 'OPEN'").iterrows():
         try:
             current = price_for(trade["address"])
             if not current or not trade["entry"]:
                 continue
-
-            change = (current / trade["entry"]) - 1
+            change = current / trade["entry"] - 1
 
             if change <= -0.10 or change >= 0.30:
                 pnl = trade["amount"] * change
                 con.execute("""
-                    UPDATE paper_trades_v2
-                    SET status='CLOSED', exit=?, pnl=?, closed=?
-                    WHERE id=?
+                UPDATE paper_trades_v2
+                SET status='CLOSED', exit=?, pnl=?, closed=?
+                WHERE id=?
                 """, (
-                    current, pnl,
-                    datetime.now().isoformat(),
-                    int(trade["id"])
+                    current, pnl, datetime.now().isoformat(), int(trade["id"])
                 ))
         except Exception:
             pass
     con.commit()
 
-st_autorefresh(interval=15000, key="refresh")
+def portfolio_value():
+    value = cash_left()
+    for _, trade in positions().query("status == 'OPEN'").iterrows():
+        try:
+            current = price_for(trade["address"])
+            value += trade["amount"] * current / trade["entry"] if current else trade["amount"]
+        except Exception:
+            value += trade["amount"]
+    return value
+
+st_autorefresh(interval=10000, key="refresh")
 
 st.subheader("Gemini connection")
-
 if st.button("Test Gemini connection"):
     try:
-        answer = ask_gemini('Reply with exactly the word OK')
+        answer = ask_gemini("Reply with exactly OK")
         st.success("Gemini works: " + answer[:100])
     except Exception as e:
         st.error(str(e))
 
 st.divider()
-
 if "tokens" not in st.session_state:
     st.session_state.tokens = []
-
 if "scan_error" not in st.session_state:
     st.session_state.scan_error = ""
 
@@ -255,26 +210,17 @@ if st.button("Scan Solana with Gemini AI", type="primary"):
     st.session_state.tokens = []
     st.session_state.scan_error = ""
 
-    with st.spinner("Fetching Solana tokens..."):
+    with st.spinner("Finding Solana tokens..."):
         try:
             found = get_tokens()
             if not found:
-                raise Exception("DexScreener ni vrnil tokenov. Poskusi znova kasneje.")
-
+                raise Exception("DexScreener ni našel tokenov.")
             st.session_state.tokens = found
 
             try:
-                scores = ai_scores(found)
-                for token in st.session_state.tokens:
-                    result = scores.get(token["symbol"], {})
-                    token["score"] = int(result.get("score", 0))
-                    token["reason"] = result.get("reason", "Gemini ni ocenil tokena.")
+                analyze_tokens(st.session_state.tokens)
             except Exception as e:
                 st.session_state.scan_error = "Gemini analiza ni uspela: " + str(e)
-                for token in st.session_state.tokens:
-                    token["score"] = 0
-                    token["reason"] = "Gemini analiza ni uspela."
-
         except Exception as e:
             st.session_state.scan_error = str(e)
 
@@ -284,99 +230,97 @@ if st.session_state.scan_error:
 st.subheader("Solana token scanner")
 
 if st.session_state.tokens:
-    for i, token in enumerate(st.session_state.tokens):
-        with st.container(border=True):
-            st.write(f"**{token['name']} ({token['symbol']})**")
-            a, b, c = st.columns(3)
-            a.metric("Price", f"${token['price']:.8f}")
-            b.metric("Liquidity", f"${token['liquidity']:,.0f}")
-            c.metric("Gemini score", f"{token.get('score', 0)}/100")
+    table_data = pd.DataFrame(st.session_state.tokens)
+    st.dataframe(
+        table_data[
+            ["Name", "Symbol", "Price ($)", "Liquidity ($)",
+             "Volume 24h ($)", "Change 24h (%)", "Gemini score"]
+        ],
+        use_container_width=True,
+        hide_index=True
+    )
 
-            st.write(
-                f"24h volume: ${token['volume']:,.0f} | "
-                f"24h change: {token['change']:.2f}%"
-            )
-            st.caption(token.get("reason", ""))
+    st.caption("Izberi token spodaj za paper nakup.")
+    choices = [
+        f"{i + 1}. {t['Symbol']} | {t['Name']}"
+        for i, t in enumerate(st.session_state.tokens)
+    ]
+    selected = st.selectbox("Izberi token", choices)
+    index = choices.index(selected)
+    token = st.session_state.tokens[index]
 
-            if token.get("url"):
-                st.markdown(f"[Open DexScreener]({token['url']})")
+    st.write("**Gemini razlog:**", token["Reason"])
+    if token["URL"]:
+        st.markdown(f"[Odpri na DexScreener]({token['URL']})")
 
-            if st.button("Paper buy $25", key=f"buy_{i}"):
-                cash = get_cash()
-                if cash < 25:
-                    st.error("Not enough paper cash.")
-                else:
-                    con.execute("""
-                        INSERT INTO paper_trades_v2
-                        (token,address,entry,amount,status,opened)
-                        VALUES (?,?,?,?,?,?)
-                    """, (
-                        token["symbol"], token["address"],
-                        token["price"], 25, "OPEN",
-                        datetime.now().isoformat()
-                    ))
-                    con.commit()
-                    st.success("Paper trade opened!")
-                    st.rerun()
+    if st.button("Paper buy $25"):
+        if cash_left() < 25:
+            st.error("Ni dovolj paper denarja.")
+        else:
+            con.execute("""
+            INSERT INTO paper_trades_v2
+            (token,address,entry,amount,status,opened)
+            VALUES (?,?,?,?,?,?)
+            """, (
+                token["Symbol"], token["Address"], token["Price ($)"],
+                25, "OPEN", datetime.now().isoformat()
+            ))
+            con.commit()
+            st.success("Paper trade odprt!")
+            st.rerun()
 else:
-    st.info("Press Scan Solana with Gemini AI to find tokens.")
+    st.info("Pritisni Scan Solana with Gemini AI za skeniranje.")
 
 st.divider()
 check_trades()
-snapshot()
-
-positions = get_positions()
-cash = get_cash()
-open_positions = positions[positions["status"] == "OPEN"]
-closed_positions = positions[positions["status"] == "CLOSED"]
-
-portfolio_value = cash
-for _, trade in open_positions.iterrows():
-    try:
-        current = price_for(trade["address"])
-        if current:
-            portfolio_value += trade["amount"] * current / trade["entry"]
-        else:
-            portfolio_value += trade["amount"]
-    except Exception:
-        portfolio_value += trade["amount"]
-
-total_pnl = portfolio_value - STARTING_CASH
+value = portfolio_value()
+cash = cash_left()
+pnl = value - STARTING_CASH
 
 st.subheader("Paper trading dashboard")
 a, b, c = st.columns(3)
-a.metric("Portfolio value", f"${portfolio_value:.2f}")
+a.metric("Portfolio value", f"${value:.2f}")
 b.metric("Available cash", f"${cash:.2f}")
-c.metric("Total P/L", f"${total_pnl:.2f}")
+c.metric("Total P/L", f"${pnl:.2f}")
+
+all_positions = positions()
+opened = all_positions[all_positions["status"] == "OPEN"]
+closed = all_positions[all_positions["status"] == "CLOSED"]
 
 st.subheader("Open positions")
-if not open_positions.empty:
+if not opened.empty:
     st.dataframe(
-        open_positions[["token", "entry", "amount", "opened"]],
-        use_container_width=True
+        opened[["token", "entry", "amount", "opened"]],
+        use_container_width=True,
+        hide_index=True
     )
 else:
-    st.info("No open positions.")
+    st.info("Ni odprtih pozicij.")
 
 st.subheader("Portfolio history")
+con.execute(
+    "INSERT INTO portfolio_snapshots_v2 (time,value) VALUES (?,?)",
+    (datetime.now().strftime("%H:%M:%S"), value)
+)
+con.commit()
+
 history = pd.read_sql_query(
     "SELECT time,value FROM portfolio_snapshots_v2 ORDER BY id", con
 )
 if not history.empty:
     st.line_chart(history.set_index("time")["value"])
-else:
-    st.info("Graph will appear after snapshots are collected.")
 
 st.subheader("Closed trades")
-if not closed_positions.empty:
+if not closed.empty:
     st.dataframe(
-        closed_positions[["token", "entry", "exit", "amount", "pnl", "closed"]],
-        use_container_width=True
+        closed[["token", "entry", "exit", "amount", "pnl", "closed"]],
+        use_container_width=True,
+        hide_index=True
     )
 else:
-    st.info("No closed trades yet.")
+    st.info("Ni zaprtih poslov.")
 
 st.caption(
-    "Paper trading only. Stop loss and take profit are checked on app refresh. "
-    "They are not guaranteed execution prices. Gemini scores are experimental."
+    "Paper trading only. Stop loss -10% and take profit +30% "
+    "are checked every refresh. Execution price is not guaranteed."
 )
