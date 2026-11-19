@@ -22,7 +22,7 @@ st.set_page_config(
 DB = "bot.db"
 MODEL = "gemini-3.8-flash"
 STARTING_CASH = 1000.0
-REFRESH_MS = 10000
+REFRESH_MS = 5000
 
 # =========================
 # PREMIUM DESIGN
